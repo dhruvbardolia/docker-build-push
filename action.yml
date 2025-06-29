@@ -1,10 +1,12 @@
 name: "Build and Push Docker Image"
-description: "Builds and pushes Docker images to ECR, GCR, ACR, or Docker Hub using Python"
+description: "Builds and pushes Docker images to ECR, GCR, ACR, or Docker Hub"
 
 inputs:
   registry:
     required: true
     description: "Registry type: ecr | gcr | acr | dockerhub"
+
+  # Common inputs
   image:
     required: true
     description: "Image name (e.g., my-app)"
@@ -20,15 +22,21 @@ inputs:
   image-previous-version:
     required: false
     description: "Previous image version (for build cache)"
+
+  # AWS ECR
   aws-role:
     required: false
     description: "AWS IAM role to assume"
   aws-region:
     required: false
     description: "AWS region"
+
+  # GCP Artifact Registry
   project-id:
     required: false
     description: "GCP project ID"
+
+  # Docker Hub / ACR / GCR
   username:
     required: false
     description: "Username (Docker Hub / ACR / GCR)"
@@ -48,19 +56,68 @@ runs:
   using: composite
 
   steps:
-  
-    - name: Checkout
-      uses: actions/checkout@v3
+    - name: Set up AWS Credentials (if ECR)
+      if: ${{ inputs.registry == 'ecr' }}
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: ${{ inputs.aws-role }}
+        role-session-name: GitHubActionSession
+        aws-region: ${{ inputs.aws-region }}
 
-    - name: Install Python and Docker dependencies
+    - name: Login to Registry
+      id: login
       shell: bash
       run: |
-        sudo apt-get update -y
-        sudo apt-get install -y python3 python3-pip
-        python3 --version
-        pip3 install --upgrade pip
+        REGISTRY_TYPE="${{ inputs.registry }}"
+        case "$REGISTRY_TYPE" in
+          ecr)
+            echo "Logging into AWS ECR..."
+            REGISTRY_URL="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"
+            aws ecr get-login-password --region ${{ inputs.aws-region }} | docker login --username AWS --password-stdin "$REGISTRY_URL"
+            echo "REGISTRY_URL=$REGISTRY_URL" >> $GITHUB_ENV
+            ;;
 
-    - name: Execute Python script
+          gcr)
+            echo "Logging into GCR..."
+            echo "${{ inputs.password }}" | docker login -u _json_key https://gcr.io --password-stdin
+            echo "REGISTRY_URL=gcr.io/${{ inputs.project-id }}" >> $GITHUB_ENV
+            ;;
+
+          acr)
+            echo "Logging into ACR..."
+            echo "${{ inputs.password }}" | docker login ${{ inputs.registry-url }} -u ${{ inputs.username }} --password-stdin
+            echo "REGISTRY_URL=${{ inputs.registry-url }}" >> $GITHUB_ENV
+            ;;
+
+          dockerhub)
+            echo "Logging into Docker Hub..."
+            echo "${{ inputs.password }}" | docker login -u ${{ inputs.username }} --password-stdin
+            echo "REGISTRY_URL=docker.io" >> $GITHUB_ENV
+            ;;
+
+          *)
+            echo "❌ Unsupported registry: $REGISTRY_TYPE"
+            exit 1
+            ;;
+        esac
+
+    - name: Build and Push Docker Image
       id: build
       shell: bash
-      run: python3 main.py
+      run: |
+        IMAGE_TAG="${{ inputs.image-version }}"
+        IMAGE_NAME="${{ inputs.image }}"
+        FULL_IMAGE="${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+        BUILD_ARGS=$(echo "${{ inputs.args }}" | sed 's/^[ \t]*//' | tr '\n' ' ' | sed 's/[^ ][^ ]*/--build-arg &/g')
+
+        if [[ -n "${{ inputs.image-previous-version }}" ]]; then
+          echo "Using cache from previous version..."
+          docker buildx build -t "$FULL_IMAGE" $BUILD_ARGS -f "${{ inputs.image-dockerfile }}" . --cache-to type=inline --cache-from type=registry,ref="${{ inputs.image-previous-version }}"
+        else
+          docker build -t "$FULL_IMAGE" $BUILD_ARGS -f "${{ inputs.image-dockerfile }}" .
+        fi
+
+        docker push "$FULL_IMAGE"
+        echo "✅ Pushed $FULL_IMAGE"
+        echo "image=$FULL_IMAGE" >> $GITHUB_OUTPUT
