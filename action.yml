@@ -1,67 +1,123 @@
-name: "Build image"
-description: "Builds image"
+name: "Build and Push Docker Image"
+description: "Builds and pushes Docker images to ECR, GCR, ACR, or Docker Hub"
 
 inputs:
-  aws-role:
+  registry:
     required: true
-    description: "AWS role to assume"
-  aws-region:
-    required: true
-    description: "AWS region"
-  image-dockerfile:
-    required: true
-    description: "Dockerfile"
+    description: "Registry type: ecr | gcr | acr | dockerhub"
+
+  # Common inputs
   image:
     required: true
-    description: "Image name"
+    description: "Image name (e.g., my-app)"
   image-version:
-    description: "Image version"
-  image-previous-version:
-    required: false
-    description: "Previous image version"
+    required: true
+    description: "Tag/version of the image"
+  image-dockerfile:
+    required: true
+    description: "Path to the Dockerfile"
   args:
     required: false
-    description: "Arguments to pass to the command"
+    description: "Additional build arguments"
+  image-previous-version:
+    required: false
+    description: "Previous image version (for build cache)"
+
+  # AWS ECR
+  aws-role:
+    required: false
+    description: "AWS IAM role to assume"
+  aws-region:
+    required: false
+    description: "AWS region"
+
+  # GCP Artifact Registry
+  project-id:
+    required: false
+    description: "GCP project ID"
+
+  # Docker Hub / ACR / GCR
+  username:
+    required: false
+    description: "Username (Docker Hub / ACR / GCR)"
+  password:
+    required: false
+    description: "Password or token (Docker Hub / ACR / GCR)"
+  registry-url:
+    required: false
+    description: "Custom registry URL (e.g., for ACR)"
 
 outputs:
   image:
-    description: "Image name"
+    description: "The full image name"
     value: ${{ steps.build.outputs.image }}
 
 runs:
-
   using: composite
 
   steps:
-    - name: Configure AWS credentials
+    - name: Set up AWS Credentials (if ECR)
+      if: ${{ inputs.registry == 'ecr' }}
       uses: aws-actions/configure-aws-credentials@v1
       with:
         role-to-assume: ${{ inputs.aws-role }}
-        role-session-name: Github
+        role-session-name: GitHubActionSession
         aws-region: ${{ inputs.aws-region }}
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-      with:
-        mask-password: 'true'
+    - name: Login to Registry
+      id: login
+      shell: bash
+      run: |
+        REGISTRY_TYPE="${{ inputs.registry }}"
+        case "$REGISTRY_TYPE" in
+          ecr)
+            echo "Logging into AWS ECR..."
+            REGISTRY_URL="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"
+            aws ecr get-login-password --region ${{ inputs.aws-region }} | docker login --username AWS --password-stdin "$REGISTRY_URL"
+            echo "REGISTRY_URL=$REGISTRY_URL" >> $GITHUB_ENV
+            ;;
 
-    - name: Build and push image
+          gcr)
+            echo "Logging into GCR..."
+            echo "${{ inputs.password }}" | docker login -u _json_key https://gcr.io --password-stdin
+            echo "REGISTRY_URL=gcr.io/${{ inputs.project-id }}" >> $GITHUB_ENV
+            ;;
+
+          acr)
+            echo "Logging into ACR..."
+            echo "${{ inputs.password }}" | docker login ${{ inputs.registry-url }} -u ${{ inputs.username }} --password-stdin
+            echo "REGISTRY_URL=${{ inputs.registry-url }}" >> $GITHUB_ENV
+            ;;
+
+          dockerhub)
+            echo "Logging into Docker Hub..."
+            echo "${{ inputs.password }}" | docker login -u ${{ inputs.username }} --password-stdin
+            echo "REGISTRY_URL=docker.io" >> $GITHUB_ENV
+            ;;
+
+          *)
+            echo "❌ Unsupported registry: $REGISTRY_TYPE"
+            exit 1
+            ;;
+        esac
+
+    - name: Build and Push Docker Image
       id: build
       shell: bash
-      env:
-        IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.image }}:${{ inputs.image-version }}
-        GH_TOKEN: ${{ github.token }}
       run: |
-        BUILD_ARGS=$(echo "${{inputs.args}}" | sed 's/^[ \t]*//' | tr '\n' ' '| sed 's/[^ ][^ ]*/--build-arg &/g')
+        IMAGE_TAG="${{ inputs.image-version }}"
+        IMAGE_NAME="${{ inputs.image }}"
+        FULL_IMAGE="${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+        BUILD_ARGS=$(echo "${{ inputs.args }}" | sed 's/^[ \t]*//' | tr '\n' ' ' | sed 's/[^ ][^ ]*/--build-arg &/g')
+
         if [[ -n "${{ inputs.image-previous-version }}" ]]; then
-          build_cmd="docker buildx build -t $IMAGE $BUILD_ARGS -f ${{ inputs.image-dockerfile }} . --cache-to type=inline --cache-from type=registry,ref=${{ inputs.image-previous-version }}"
+          echo "Using cache from previous version..."
+          docker buildx build -t "$FULL_IMAGE" $BUILD_ARGS -f "${{ inputs.image-dockerfile }}" . --cache-to type=inline --cache-from type=registry,ref="${{ inputs.image-previous-version }}"
         else
-          build_cmd="docker build -t $IMAGE $BUILD_ARGS -f ${{ inputs.image-dockerfile }} ."
+          docker build -t "$FULL_IMAGE" $BUILD_ARGS -f "${{ inputs.image-dockerfile }}" .
         fi
-        echo $build_cmd
-        $build_cmd
-        # get value of check_args
-        # Form build args string from comma-separated list
-        docker push $IMAGE
-        echo "image=$IMAGE" >> $GITHUB_OUTPUT 
+
+        docker push "$FULL_IMAGE"
+        echo "✅ Pushed $FULL_IMAGE"
+        echo "image=$FULL_IMAGE" >> $GITHUB_OUTPUT
