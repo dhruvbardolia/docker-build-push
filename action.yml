@@ -1,0 +1,67 @@
+name: "Build image"
+description: "Builds image"
+
+inputs:
+  aws-role:
+    required: true
+    description: "AWS role to assume"
+  aws-region:
+    required: true
+    description: "AWS region"
+  image-dockerfile:
+    required: true
+    description: "Dockerfile"
+  image:
+    required: true
+    description: "Image name"
+  image-version:
+    description: "Image version"
+  image-previous-version:
+    required: false
+    description: "Previous image version"
+  args:
+    required: false
+    description: "Arguments to pass to the command"
+
+outputs:
+  image:
+    description: "Image name"
+    value: ${{ steps.build.outputs.image }}
+
+runs:
+
+  using: composite
+
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: ${{ inputs.aws-role }}
+        role-session-name: Github
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+      with:
+        mask-password: 'true'
+
+    - name: Build and push image
+      id: build
+      shell: bash
+      env:
+        IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.image }}:${{ inputs.image-version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        BUILD_ARGS=$(echo "${{inputs.args}}" | sed 's/^[ \t]*//' | tr '\n' ' '| sed 's/[^ ][^ ]*/--build-arg &/g')
+        if [[ -n "${{ inputs.image-previous-version }}" ]]; then
+          build_cmd="docker buildx build -t $IMAGE $BUILD_ARGS -f ${{ inputs.image-dockerfile }} . --cache-to type=inline --cache-from type=registry,ref=${{ inputs.image-previous-version }}"
+        else
+          build_cmd="docker build -t $IMAGE $BUILD_ARGS -f ${{ inputs.image-dockerfile }} ."
+        fi
+        echo $build_cmd
+        $build_cmd
+        # get value of check_args
+        # Form build args string from comma-separated list
+        docker push $IMAGE
+        echo "image=$IMAGE" >> $GITHUB_OUTPUT 
