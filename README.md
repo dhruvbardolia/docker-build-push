@@ -1,0 +1,1 @@
+## Building and pushing Docker image to registery
